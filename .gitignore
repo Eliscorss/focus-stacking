@@ -1,0 +1,19 @@
+# Python 缓存及本地环境
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# 本地编辑器及操作系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 原始输入与生成结果；保留目录占位。
+# 正式 Git 交付时可明确解除指定结果的忽略规则，或使用 git add -f。
+/data/raw/*
+!/data/raw/.gitkeep
+/results/*
+!/results/.gitkeep

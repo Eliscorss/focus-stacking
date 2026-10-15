@@ -1,0 +1,4 @@
+# Image processing and noninteractive comparison charts.
+numpy>=1.24
+opencv-python>=4.8
+matplotlib>=3.7
