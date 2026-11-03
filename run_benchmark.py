@@ -12,17 +12,18 @@ import cv2
 import numpy as np
 
 from evaluations import sharpness
-from methods import laplacian, method_a, method_b
+from methods import guided_filter, laplacian, laplacian_pyramid
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
 RESULTS_DIR = PROJECT_ROOT / "results"
-VIEWS = ("flank", "rake", "face")
+VIEW_PATTERN = re.compile(r"view[1-9][0-9]*")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
-METHODS = {"laplacian": laplacian.stack,
-           "method_a": method_a.stack, "method_b": method_b.stack}
-UNIMPLEMENTED = {"method_a", "method_b"}
+METHODS = {"laplacian": laplacian.stack, "guided_filter": guided_filter.stack,
+           "laplacian_pyramid": laplacian_pyramid.stack}
+# Placeholder methods are reported as not_implemented without being called.
+UNIMPLEMENTED = set()
 CSV_FIELDS = ("tool", "view", "method", "image_count", "tenengrad",
               "laplacian_variance", "fusion_seconds", "status", "error")
 
@@ -35,7 +36,7 @@ def natural_key(path):
 
 
 def resolve_input(value):
-    """Accept only a tool or a known view directly inside the raw-data root."""
+    """Accept a tool or one numbered view directly inside the raw-data root."""
     path = Path(value).expanduser()
     if not path.is_absolute():
         path = PROJECT_ROOT / path
@@ -43,14 +44,19 @@ def resolve_input(value):
     try:
         parts = path.relative_to(RAW_DIR.resolve()).parts
     except ValueError as exc:
-        raise ValueError("Input must be inside data/raw/<tool>[/<view>].") from exc
+        raise ValueError("Input must be inside data/raw/<tool>[/view<N>].") from exc
     if not path.is_dir():
         raise ValueError(f"Input directory does not exist: {path}")
     if len(parts) == 1:
-        return parts[0], [path / view for view in VIEWS]
-    if len(parts) == 2 and parts[1] in VIEWS:
+        views = sorted((child for child in path.iterdir()
+                        if child.is_dir() and VIEW_PATTERN.fullmatch(child.name)),
+                       key=natural_key)
+        if not views:
+            raise ValueError(f"No view<N> directories found in {path}; use view1, view2, ...")
+        return parts[0], views
+    if len(parts) == 2 and VIEW_PATTERN.fullmatch(parts[1]):
         return parts[0], [path]
-    raise ValueError("Specify data/raw/<tool> or its flank, rake, or face directory.")
+    raise ValueError("Specify data/raw/<tool> or data/raw/<tool>/view<N> (view1, view2, ...).")
 
 
 def load_images(directory):
@@ -235,7 +241,10 @@ def save_chart(path, rows, title):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    figure, axes = plt.subplots(1, 2, figsize=(11, 4.5), layout="constrained")
+    # Widen the figure and tilt labels when sweeps add many long row names.
+    tilted = len(rows) > 3
+    figure, axes = plt.subplots(1, 2, figsize=(max(11, 1.8 * len(rows)), 5 if tilted else 4.5),
+                                layout="constrained")
     try:
         for axis, metric, label in zip(axes, ("tenengrad", "laplacian_variance"),
                                        ("Tenengrad", "Laplacian variance")):
@@ -251,10 +260,12 @@ def save_chart(path, rows, title):
                               transform=axis.get_xaxis_transform(), ha="center", fontsize=9)
             if not valid:
                 axis.text(0.5, 0.65, "No valid scores", transform=axis.transAxes, ha="center")
-            axis.set_xticks(range(len(rows)), [row["method"] for row in rows])
+            axis.set_xticks(range(len(rows)), [row["method"] for row in rows],
+                            rotation=30 if tilted else 0, ha="right" if tilted else "center")
             axis.set_xlim(-0.6, len(rows) - 0.4)
-            axis.set_ylim(bottom=0)
-            axis.margins(y=0.22)
+            # Leave headroom so value labels never touch the frame.
+            top = max((row[metric] for _, row in valid), default=0)
+            axis.set_ylim(0, top * 1.18 if top > 0 else 1)
             axis.set_title(label)
             axis.set_ylabel("Score")
             axis.grid(axis="y", alpha=0.25)
@@ -267,21 +278,61 @@ def save_chart(path, rows, title):
         plt.close(figure)
 
 
+# energy_weights is a matrix, so it sweeps by window size within one fixed weight shape.
+ENERGY_SWEEPS = {"energy_size": laplacian_pyramid.binomial_weights,
+                 "energy_box": laplacian_pyramid.box_weights}
+
+
+def sweep_overrides(name, value):
+    """Map one sweep value to the pyramid keyword it overrides."""
+    if name in ENERGY_SWEEPS:
+        return {"energy_weights": ENERGY_SWEEPS[name](value)}
+    return {name: value}
+
+
+def expand_runs(selected, sweep):
+    """Return (row name, method, overrides); a sweep replaces the single pyramid run."""
+    runs = []
+    for method in selected:
+        if method == "laplacian_pyramid" and sweep:
+            name, values = sweep
+            runs += [(f"{method}_{name}{value}", method, sweep_overrides(name, value))
+                     for value in values]
+        else:
+            runs.append((method, method, {}))
+    return runs
+
+
 def run_view(tool, directory, selected, args):
     """Prepare a view once and reuse read-only arrays across all selected methods."""
+    sweep = args.sweep
+    # Sweeps get their own folder so the regular benchmark results stay untouched.
     output = RESULTS_DIR / tool / directory.name
+    if sweep:
+        output = output / f"sweep_{sweep[0]}"
     resolved_output = output.resolve()
     if (RESULTS_DIR.resolve() != RESULTS_DIR.absolute()
             or not resolved_output.is_relative_to(RESULTS_DIR.resolve())
             or resolved_output.is_relative_to(RAW_DIR.resolve())):
         raise ValueError("Output must stay within results and outside raw data.")
     output.mkdir(parents=True, exist_ok=True)
+    if sweep:
+        # Images from an earlier sweep of the same parameter may use other values.
+        for stale in output.glob(f"laplacian_pyramid_{sweep[0]}*.png"):
+            if not stale.resolve().is_relative_to(RESULTS_DIR.resolve()):
+                raise ValueError("Existing result image resolves outside results.")
+            stale.unlink()
+    # Shared settings first; each method's effective parameters are added per method.
+    parameters = {"registration_max_size": args.registration_max_size,
+                  "roi_xywh_in_cropped_image": args.roi}
+    if "laplacian" in selected:
+        parameters["laplacian"] = {"window_size": args.window_size,
+                                   "smooth_size": args.smooth_size}
     info = {"started_utc": datetime.now(timezone.utc).isoformat(),
             "input_directory": str(directory.relative_to(PROJECT_ROOT)),
             "input_files": [], "methods": selected,
-            "parameters": {"window_size": args.window_size, "smooth_size": args.smooth_size,
-                           "registration_max_size": args.registration_max_size,
-                           "roi_xywh_in_cropped_image": args.roi},
+            "sweep": {"parameter": sweep[0], "values": sweep[1]} if sweep else None,
+            "parameters": parameters,
             "versions": {"numpy": np.__version__, "opencv": cv2.__version__},
             "registration": None}
     image_count = 0
@@ -307,10 +358,10 @@ def run_view(tool, directory, selected, args):
     info["preparation_error"] = preparation_error
 
     rows = []
-    for method in selected:
+    for name, method, overrides in expand_runs(selected, sweep):
         row = dict.fromkeys(CSV_FIELDS, "")
-        row.update(tool=tool, view=directory.name, method=method, image_count=image_count)
-        image_path = output / f"{method}.png"
+        row.update(tool=tool, view=directory.name, method=name, image_count=image_count)
+        image_path = output / f"{name}.png"
         # Remove only this selected method's old generated image to prevent stale results.
         if image_path.exists():
             if not image_path.resolve().is_relative_to(RESULTS_DIR.resolve()):
@@ -321,11 +372,23 @@ def run_view(tool, directory, selected, args):
         elif preparation_error:
             row.update(status="failed", error=preparation_error)
         else:
-            stage = "fusion"
-            start = perf_counter()
+            stage = "parameters"
             try:
-                fused = METHODS[method](aligned, gray_images=grays,
-                                        window_size=args.window_size, smooth_size=args.smooth_size)
+                # Each method receives only its own parameters. The pyramid and guided
+                # filter use their file defaults, and a sweep value overrides only the
+                # swept parameter.
+                options = {"gray_images": grays, **overrides}
+                if method == "laplacian":
+                    options.update(parameters["laplacian"])
+                elif method == "laplacian_pyramid":
+                    parameters[name] = laplacian_pyramid.resolve_parameters(
+                        aligned[0].shape, **overrides)
+                elif method == "guided_filter":
+                    parameters[name] = guided_filter.resolve_parameters(
+                        aligned[0].shape, **overrides)
+                stage = "fusion"
+                start = perf_counter()
+                fused = METHODS[method](aligned, **options)
                 row["fusion_seconds"] = perf_counter() - start
                 if not isinstance(fused, np.ndarray) or fused.shape != aligned[0].shape or fused.dtype != aligned[0].dtype:
                     raise ValueError("Fusion must return an image with the input shape and dtype.")
@@ -344,7 +407,7 @@ def run_view(tool, directory, selected, args):
                     row["fusion_seconds"] = perf_counter() - start
                 row.update(status="failed", error=f"{stage}: {type(exc).__name__}: {exc}")
         rows.append(row)
-        print(f"{tool}/{directory.name}: {method}: {row['status']}"
+        print(f"{tool}/{directory.name}: {name}: {row['status']}"
               + (f" ({row['error']})" if row["error"] else f" ({row['fusion_seconds']:.3f} s)"))
 
     temporary = output / "benchmark.csv.tmp"
@@ -357,34 +420,75 @@ def run_view(tool, directory, selected, args):
     temporary = output / "run_info.json.tmp"
     temporary.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(output / "run_info.json")
-    save_chart(output / "metrics_comparison.png", rows, f"{tool} / {directory.name}")
+    title = f"{tool} / {directory.name}" + (f" (sweep {sweep[0]})" if sweep else "")
+    save_chart(output / "metrics_comparison.png", rows, title)
     return any(row["status"] == "success" for row in rows), preparation_error is not None or any(
         row["status"] == "failed" for row in rows)
 
 
+def parse_sweep(parser, values, selected):
+    """Validate --pyramid-sweep NAME VALUE...; integer parameters or energy window sizes."""
+    name, *raw = values
+    names = [key for key, value in laplacian_pyramid.DEFAULT_PARAMETERS.items()
+             if isinstance(value, int)] + list(ENERGY_SWEEPS)
+    if name not in names:
+        parser.error(f"--pyramid-sweep parameter must be one of: {', '.join(names)}")
+    if "laplacian_pyramid" not in selected:
+        parser.error("--pyramid-sweep requires --method laplacian_pyramid or all.")
+    if not raw:
+        parser.error("--pyramid-sweep needs at least one value.")
+    try:
+        numbers = [int(value) for value in raw]
+    except ValueError:
+        parser.error("--pyramid-sweep values must be integers.")
+    if len(set(numbers)) != len(numbers):
+        parser.error("--pyramid-sweep values must not repeat.")
+    for number in numbers:
+        try:
+            # A large nominal size checks the value itself; image size is checked per view.
+            laplacian_pyramid.resolve_parameters((1 << 16, 1 << 16),
+                                                 **sweep_overrides(name, number))
+        except ValueError as exc:
+            parser.error(f"--pyramid-sweep {name}={number}: {exc}")
+    return name, numbers
+
+
 def main(argv=None):
-    """Run one tool or view; return a nonzero exit code for actual failures."""
+    """Run tools or views; return a nonzero exit code for actual failures."""
     parser = argparse.ArgumentParser(description="SG3 focus stacking benchmark")
-    parser.add_argument("--input", required=True, help="data/raw/<tool> or data/raw/<tool>/<view>")
+    parser.add_argument("--input", required=True, nargs="+",
+                        help="One or more data/raw/<tool> or data/raw/<tool>/view<N> paths")
     parser.add_argument("--method", choices=["all", *METHODS], default="all")
-    parser.add_argument("--window-size", type=int, default=21, help="Odd local focus window size")
-    parser.add_argument("--smooth-size", type=int, default=5, help="Odd majority window; 1 disables smoothing")
+    parser.add_argument("--window-size", type=int, default=21,
+                        help="Laplacian baseline only: odd local focus window size")
+    parser.add_argument("--smooth-size", type=int, default=5,
+                        help="Laplacian baseline only: odd majority window; 1 disables smoothing")
     parser.add_argument("--registration-max-size", type=int, default=1600,
                         help="Maximum feature-estimation dimension; output stays full resolution")
     parser.add_argument("--roi", type=int, nargs=4, metavar=("X", "Y", "WIDTH", "HEIGHT"),
                         help="Evaluation rectangle in cropped output coordinates; default: full valid area")
+    parser.add_argument("--pyramid-sweep", nargs="+", metavar=("NAME", "VALUE"),
+                        help="Run laplacian_pyramid once per value of one integer parameter, "
+                             "e.g. levels 3 4 5 6 7, or per energy window size with binomial "
+                             "(energy_size 1 3 5 7) or uniform (energy_box 3) weights; "
+                             "results go to sweep_<NAME>/")
     args = parser.parse_args(argv)
     if any(size < 1 or size % 2 == 0 for size in (args.window_size, args.smooth_size)):
         parser.error("Window sizes must be positive odd integers.")
     if args.registration_max_size < 64:
         parser.error("Registration maximum size must be at least 64.")
-    try:
-        tool, directories = resolve_input(args.input)
-    except ValueError as exc:
-        parser.error(str(exc))
+    jobs = []
+    for value in args.input:
+        try:
+            tool, directories = resolve_input(value)
+        except ValueError as exc:
+            parser.error(str(exc))
+        # Skip views repeated by overlapping inputs, keeping the first occurrence.
+        jobs += [(tool, directory) for directory in directories if (tool, directory) not in jobs]
     selected = list(METHODS) if args.method == "all" else [args.method]
+    args.sweep = parse_sweep(parser, args.pyramid_sweep, selected) if args.pyramid_sweep else None
     any_success, any_failure = False, False
-    for directory in directories:
+    for tool, directory in jobs:
         try:
             success, failed = run_view(tool, directory, selected, args)
             any_success |= success
