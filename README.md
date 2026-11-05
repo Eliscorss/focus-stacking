@@ -25,7 +25,6 @@ focus-stacking/
 ├── evaluations/              # 清晰度指标；自动伪影评价仍为占位
 ├── results/                  # 融合图像和实验报告
 ├── run_benchmark.py          # 统一运行入口
-├── test_focus_stacking.py    # 测试
 └── requirements.txt          # Python 依赖
 ```
 
@@ -47,7 +46,7 @@ python -m venv .venv
 ```powershell
 # 处理该刀具的所有视角，默认运行全部算法并评价
 .venv\Scripts\python.exe run_benchmark.py --input "data\raw\tool_01" --method all
-
+.venv\Scripts\python.exe run_benchmark.py --input "data\raw\Kro_DEMO_10" --method all
 # 仅处理一个视角，分别选择三种算法
 .venv\Scripts\python.exe run_benchmark.py --input "data\raw\tool_01\view1" --method laplacian
 .venv\Scripts\python.exe run_benchmark.py --input "data\raw\tool_01\view1" --method guided_filter
@@ -68,7 +67,7 @@ python -m venv .venv
 |---|---|
 | `--window-size 21` | Baseline 的局部清晰度窗口边长，默认 21 像素，须为正奇数。 |
 | `--smooth-size 5` | Baseline 的多数投票窗口边长，默认 5 像素，须为正奇数；设为 1 关闭平滑。 |
-| `--roi X Y WIDTH HEIGHT` | 指定清晰度评价矩形，坐标基于配准裁剪后的输出图；默认评价整个有效区域。 |
+| `--roi X Y WIDTH HEIGHT` | 指定清晰度评价矩形，坐标基于配准裁剪后的输出图；默认评价整个有效区域。指定时额外生成 `roi_preview.png`。 |
 | `--registration-max-size 1600` | 配准特征估计的最长边上限，默认 1600 像素，输出保留原始像素尺度并裁剪公共有效区域。 |
 
 GFDF 和金字塔方法的默认参数集中在 [guided_filter.py](methods/guided_filter.py) 和 [laplacian_pyramid.py](methods/laplacian_pyramid.py) 顶部的 `DEFAULT_PARAMETERS`。修改后重新运行即可生效，参数的范围、来源和影响见代码注释。GFDF 默认值来自论文和作者代码；金字塔默认层数 5、能量窗口 5×5、顶层窗口 3×3、熵灰度级数 256 为工程选择，其中能量窗口等参数经 `Kro_DEMO_10` 数据检查，不代表其他刀具上的最优值。实际生效参数写入 `run_info.json`。
@@ -81,6 +80,21 @@ GFDF 和金字塔方法的默认参数集中在 [guided_filter.py](methods/guide
 
 扫描支持 `levels`、`min_top_size`、`top_window`、`entropy_bins`，以及能量窗口边长 `energy_size`（二项式权重）和 `energy_box`（均匀权重）。扫描值覆盖对应默认参数，结果保存到该视角的 `sweep_<参数名>/` 子目录。
 
+GFDF 参数用 `--guided-sweep` 扫描，例如比较不同的去小区域阈值：
+
+```powershell
+.venv\Scripts\python.exe run_benchmark.py --input "data\raw\tool_01\view1" --method all --guided-sweep small_region_ratio 0 0.001 0.005 0.01
+```
+
+可扫描 `guided_filter.py` 顶部的全部 6 个参数：`mean_window`、`focus_radius`、`weight_radius` 取整数，`focus_eps`、`weight_eps`、`small_region_ratio` 可取小数。
+
+两种扫描的共同规则：
+- 每次只扫描一个参数，`--pyramid-sweep` 和 `--guided-sweep` 不能同时使用。
+- 必须选中被扫描的方法（`--method` 为该方法或 `all`）。用 `all` 时，其他方法按默认参数各运行一次，作为参照。
+- 每个取值生成一张图，图名为 `<方法>_<参数名><值>.png`，例如 `guided_filter_small_region_ratio0.005.png`。
+- 同一参数重新扫描时，先删除上次留下的扫描图。
+- 取值非法或重复时直接报错。`run_info.json` 的 `sweep` 记录方法、参数和取值，`parameters` 按图名记录每个取值实际生效的参数。
+
 ## 输出与评价
 
 常规运行结果保存在 `results/<tool>/view<N>/`：
@@ -92,16 +106,13 @@ laplacian_pyramid.png     # 金字塔融合图
 benchmark.csv             # 图像数量、清晰度指标、融合耗时、状态和错误信息
 metrics_comparison.png    # 清晰度指标对比图
 run_info.json             # 输入顺序、实际参数、配准信息及软件版本
+roi_preview.png           # 仅在指定 --roi 时生成：参考帧原图上的 ROI 红框
 ```
+
+`roi_preview.png` 的底图是配准参考帧（中间帧）的未处理原图，可与融合图对比配准裁剪前后的差异。参考帧不做变换，因此 ROI 坐标加上裁剪偏移（`run_info.json` 中 `registration.crop_xywh` 的前两个值）后与原图精确对应。红框画在 ROI 外侧，框内像素与原图一致；ROI 贴近原图边缘时，该侧红框会被截掉。`run_info.json` 的 `roi_preview` 记录底图文件名、原图坐标下的 ROI 及可能的生成错误；预览图生成失败不影响融合和评价。未指定 `--roi` 时不生成预览图，并删除上次运行留下的旧预览图。
 
 仅生成本次成功方法的融合图，保留输入位深。重复运行会替换所选方法的旧图和当前目录的报告；失败方法的旧图会被移除。
 
 当前清晰度指标为 **Tenengrad** 和 **Laplacian 方差**，分别报告，不合成总分。噪声和接缝也可能提高分数，应结合刀刃、前刀面纹理和高光区域的局部目视检查。自动接缝与伪影评价尚未实现。融合耗时只覆盖各算法的完整 `stack()` 调用，公共读取、配准、评价和保存不计入其中。
-
-运行现有测试：
-
-```powershell
-.venv\Scripts\python.exe -m unittest -v test_focus_stacking
-```
 
 原始数据与生成结果默认由 `.gitignore` 排除；正式通过 Git 交付实验时，需明确选择要纳入版本管理的结果文件。

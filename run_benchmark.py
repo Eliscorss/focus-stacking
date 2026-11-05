@@ -235,6 +235,20 @@ def save_image(path, image):
     temporary.replace(path)
 
 
+def save_roi_preview(path, image, roi):
+    """Outline ROI (x, y, width, height) in red just outside it, on a copy of one frame."""
+    x, y, w, h = roi
+    height, width = image.shape[:2]
+    # Scale the line with the image so it stays visible on large frames.
+    thickness = max(2, min(height, width) // 400)
+    preview = image.copy()
+    preview[max(y - thickness, 0):min(y + h + thickness, height),
+            max(x - thickness, 0):min(x + w + thickness, width)] = (0, 0, np.iinfo(image.dtype).max)
+    # Restore the inside so every ROI pixel stays exactly as in the source frame.
+    preview[y:y + h, x:x + w] = image[y:y + h, x:x + w]
+    save_image(path, preview)
+
+
 def save_chart(path, rows, title):
     """Plot separate metric axes and annotate unavailable methods without zero bars."""
     import matplotlib
@@ -284,18 +298,32 @@ ENERGY_SWEEPS = {"energy_size": laplacian_pyramid.binomial_weights,
 
 
 def sweep_overrides(name, value):
-    """Map one sweep value to the pyramid keyword it overrides."""
+    """Map one sweep value to the keyword it overrides; energy names exist only for the pyramid."""
     if name in ENERGY_SWEEPS:
         return {"energy_weights": ENERGY_SWEEPS[name](value)}
     return {name: value}
 
 
+def sweep_parameters(method):
+    """Return {parameter: value type} for the parameters one method can sweep."""
+    if method == "laplacian_pyramid":
+        kinds = {key: int for key, value in laplacian_pyramid.DEFAULT_PARAMETERS.items()
+                 if isinstance(value, int)}
+        return {**kinds, **dict.fromkeys(ENERGY_SWEEPS, int)}
+    # Radii and the mean window are integers; eps values and the area ratio are floats.
+    return {key: type(value) for key, value in guided_filter.DEFAULT_PARAMETERS.items()}
+
+
+SWEEP_RESOLVERS = {"laplacian_pyramid": laplacian_pyramid.resolve_parameters,
+                   "guided_filter": guided_filter.resolve_parameters}
+
+
 def expand_runs(selected, sweep):
-    """Return (row name, method, overrides); a sweep replaces the single pyramid run."""
+    """Return (row name, method, overrides); a sweep replaces the swept method's single run."""
     runs = []
     for method in selected:
-        if method == "laplacian_pyramid" and sweep:
-            name, values = sweep
+        if sweep and method == sweep[0]:
+            _, name, values = sweep
             runs += [(f"{method}_{name}{value}", method, sweep_overrides(name, value))
                      for value in values]
         else:
@@ -309,7 +337,7 @@ def run_view(tool, directory, selected, args):
     # Sweeps get their own folder so the regular benchmark results stay untouched.
     output = RESULTS_DIR / tool / directory.name
     if sweep:
-        output = output / f"sweep_{sweep[0]}"
+        output = output / f"sweep_{sweep[1]}"
     resolved_output = output.resolve()
     if (RESULTS_DIR.resolve() != RESULTS_DIR.absolute()
             or not resolved_output.is_relative_to(RESULTS_DIR.resolve())
@@ -318,7 +346,7 @@ def run_view(tool, directory, selected, args):
     output.mkdir(parents=True, exist_ok=True)
     if sweep:
         # Images from an earlier sweep of the same parameter may use other values.
-        for stale in output.glob(f"laplacian_pyramid_{sweep[0]}*.png"):
+        for stale in output.glob(f"{sweep[0]}_{sweep[1]}*.png"):
             if not stale.resolve().is_relative_to(RESULTS_DIR.resolve()):
                 raise ValueError("Existing result image resolves outside results.")
             stale.unlink()
@@ -331,13 +359,15 @@ def run_view(tool, directory, selected, args):
     info = {"started_utc": datetime.now(timezone.utc).isoformat(),
             "input_directory": str(directory.relative_to(PROJECT_ROOT)),
             "input_files": [], "methods": selected,
-            "sweep": {"parameter": sweep[0], "values": sweep[1]} if sweep else None,
+            "sweep": ({"method": sweep[0], "parameter": sweep[1], "values": sweep[2]}
+                      if sweep else None),
             "parameters": parameters,
             "versions": {"numpy": np.__version__, "opencv": cv2.__version__},
             "registration": None}
     image_count = 0
     stage = "load"
     preparation_error = None
+    preview_source = None
     start = perf_counter()
     try:
         images, files = load_images(directory)
@@ -345,6 +375,8 @@ def run_view(tool, directory, selected, args):
         info["input_files"] = [path.name for path in files]
         stage = "registration"
         aligned, info["registration"] = align_images(images, max_size=args.registration_max_size)
+        # Keep only the unwarped reference frame for the ROI preview.
+        preview_source = images[info["registration"]["reference_index"]]
         del images
         stage = "grayscale"
         grays = to_gray_images(aligned)
@@ -356,6 +388,30 @@ def run_view(tool, directory, selected, args):
         preparation_error = f"{stage}: {type(exc).__name__}: {exc}"
     info["preparation_seconds"] = perf_counter() - start
     info["preparation_error"] = preparation_error
+
+    # Remove any earlier preview first, so a run without --roi never shows an old box.
+    preview_path = output / "roi_preview.png"
+    if preview_path.exists():
+        if not preview_path.resolve().is_relative_to(RESULTS_DIR.resolve()):
+            raise ValueError("Existing result image resolves outside results.")
+        preview_path.unlink()
+    info["roi_preview"] = None
+    if args.roi and preparation_error is None:
+        # The reference frame has the identity transform, so adding the crop offset
+        # maps cropped-output coordinates exactly onto this raw frame.
+        crop_x, crop_y = info["registration"]["crop_xywh"][:2]
+        x, y, w, h = args.roi
+        raw_roi = [x + crop_x, y + crop_y, w, h]
+        reference = info["registration"]["reference_index"]
+        info["roi_preview"] = {"file": preview_path.name,
+                               "source_image": info["input_files"][reference],
+                               "roi_xywh_in_raw_image": raw_roi, "error": None}
+        try:
+            save_roi_preview(preview_path, preview_source, raw_roi)
+        except Exception as exc:
+            # A failed preview is recorded but never blocks fusion or evaluation.
+            info["roi_preview"]["error"] = f"{type(exc).__name__}: {exc}"
+    preview_source = None
 
     rows = []
     for name, method, overrides in expand_runs(selected, sweep):
@@ -420,37 +476,36 @@ def run_view(tool, directory, selected, args):
     temporary = output / "run_info.json.tmp"
     temporary.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(output / "run_info.json")
-    title = f"{tool} / {directory.name}" + (f" (sweep {sweep[0]})" if sweep else "")
+    title = f"{tool} / {directory.name}" + (f" (sweep {sweep[0]} {sweep[1]})" if sweep else "")
     save_chart(output / "metrics_comparison.png", rows, title)
     return any(row["status"] == "success" for row in rows), preparation_error is not None or any(
         row["status"] == "failed" for row in rows)
 
 
-def parse_sweep(parser, values, selected):
-    """Validate --pyramid-sweep NAME VALUE...; integer parameters or energy window sizes."""
+def parse_sweep(parser, option, method, values, selected):
+    """Validate OPTION NAME VALUE... for one method; return (method, name, values)."""
     name, *raw = values
-    names = [key for key, value in laplacian_pyramid.DEFAULT_PARAMETERS.items()
-             if isinstance(value, int)] + list(ENERGY_SWEEPS)
-    if name not in names:
-        parser.error(f"--pyramid-sweep parameter must be one of: {', '.join(names)}")
-    if "laplacian_pyramid" not in selected:
-        parser.error("--pyramid-sweep requires --method laplacian_pyramid or all.")
+    kinds = sweep_parameters(method)
+    if name not in kinds:
+        parser.error(f"{option} parameter must be one of: {', '.join(kinds)}")
+    if method not in selected:
+        parser.error(f"{option} requires --method {method} or all.")
     if not raw:
-        parser.error("--pyramid-sweep needs at least one value.")
+        parser.error(f"{option} needs at least one value.")
+    kind = kinds[name]
     try:
-        numbers = [int(value) for value in raw]
+        numbers = [kind(value) for value in raw]
     except ValueError:
-        parser.error("--pyramid-sweep values must be integers.")
+        parser.error(f"{option} {name} values must be {'integers' if kind is int else 'numbers'}.")
     if len(set(numbers)) != len(numbers):
-        parser.error("--pyramid-sweep values must not repeat.")
+        parser.error(f"{option} values must not repeat.")
     for number in numbers:
         try:
             # A large nominal size checks the value itself; image size is checked per view.
-            laplacian_pyramid.resolve_parameters((1 << 16, 1 << 16),
-                                                 **sweep_overrides(name, number))
+            SWEEP_RESOLVERS[method]((1 << 16, 1 << 16), **sweep_overrides(name, number))
         except ValueError as exc:
-            parser.error(f"--pyramid-sweep {name}={number}: {exc}")
-    return name, numbers
+            parser.error(f"{option} {name}={number}: {exc}")
+    return method, name, numbers
 
 
 def main(argv=None):
@@ -467,10 +522,15 @@ def main(argv=None):
                         help="Maximum feature-estimation dimension; output stays full resolution")
     parser.add_argument("--roi", type=int, nargs=4, metavar=("X", "Y", "WIDTH", "HEIGHT"),
                         help="Evaluation rectangle in cropped output coordinates; default: full valid area")
-    parser.add_argument("--pyramid-sweep", nargs="+", metavar=("NAME", "VALUE"),
+    sweeps = parser.add_mutually_exclusive_group()
+    sweeps.add_argument("--pyramid-sweep", nargs="+", metavar=("NAME", "VALUE"),
                         help="Run laplacian_pyramid once per value of one integer parameter, "
                              "e.g. levels 3 4 5 6 7, or per energy window size with binomial "
                              "(energy_size 1 3 5 7) or uniform (energy_box 3) weights; "
+                             "results go to sweep_<NAME>/")
+    sweeps.add_argument("--guided-sweep", nargs="+", metavar=("NAME", "VALUE"),
+                        help="Run guided_filter once per value of one parameter, e.g. "
+                             "small_region_ratio 0 0.001 0.005 0.01 or weight_eps 0.3 0.01 0.001; "
                              "results go to sweep_<NAME>/")
     args = parser.parse_args(argv)
     if any(size < 1 or size % 2 == 0 for size in (args.window_size, args.smooth_size)):
@@ -486,7 +546,13 @@ def main(argv=None):
         # Skip views repeated by overlapping inputs, keeping the first occurrence.
         jobs += [(tool, directory) for directory in directories if (tool, directory) not in jobs]
     selected = list(METHODS) if args.method == "all" else [args.method]
-    args.sweep = parse_sweep(parser, args.pyramid_sweep, selected) if args.pyramid_sweep else None
+    args.sweep = None
+    if args.pyramid_sweep:
+        args.sweep = parse_sweep(parser, "--pyramid-sweep", "laplacian_pyramid",
+                                 args.pyramid_sweep, selected)
+    elif args.guided_sweep:
+        args.sweep = parse_sweep(parser, "--guided-sweep", "guided_filter",
+                                 args.guided_sweep, selected)
     any_success, any_failure = False, False
     for tool, directory in jobs:
         try:
