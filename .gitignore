@@ -17,3 +17,8 @@ Thumbs.db
 !/data/raw/.gitkeep
 /results/*
 !/results/.gitkeep
+
+# Third-party IFCNN weights have no license for redistribution; README explains
+# where to download them. Keep only the directory placeholder.
+/methods/weights/*
+!/methods/weights/.gitkeep

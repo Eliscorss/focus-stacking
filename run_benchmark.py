@@ -15,13 +15,20 @@ from evaluations import sharpness
 from methods import guided_filter, laplacian, laplacian_pyramid
 
 
+def stack_ifcnn(images, **kwargs):
+    """Import the optional PyTorch method only when it is called."""
+    from methods import ifcnn
+
+    return ifcnn.stack(images, **kwargs)
+
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
 RESULTS_DIR = PROJECT_ROOT / "results"
 VIEW_PATTERN = re.compile(r"view[1-9][0-9]*")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 METHODS = {"laplacian": laplacian.stack, "guided_filter": guided_filter.stack,
-           "laplacian_pyramid": laplacian_pyramid.stack}
+           "laplacian_pyramid": laplacian_pyramid.stack, "ifcnn": stack_ifcnn}
 # Placeholder methods are reported as not_implemented without being called.
 UNIMPLEMENTED = set()
 CSV_FIELDS = ("tool", "view", "method", "image_count", "tenengrad",
@@ -59,22 +66,31 @@ def resolve_input(value):
     raise ValueError("Specify data/raw/<tool> or data/raw/<tool>/view<N> (view1, view2, ...).")
 
 
-def load_images(directory):
-    """Read one sequence without modifying files or silently discarding bad frames."""
+def find_image_files(directory):
+    """List candidate frames in natural order before decoding any image."""
     if not directory.is_dir():
         raise ValueError(f"View directory does not exist: {directory}")
+    return sorted((path for path in directory.iterdir()
+                   if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS),
+                  key=natural_key)
+
+
+def load_images(directory, *, files=None):
+    """Read one sequence, optionally reusing the file list recorded by the benchmark."""
+    if files is None:
+        files = find_image_files(directory)
     if any(path.is_dir() for path in directory.iterdir()):
         raise ValueError("Nested sequences are not supported; keep one sequence per view.")
-    files = sorted((path for path in directory.iterdir()
-                    if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS),
-                   key=natural_key)
     if not files:
         raise ValueError(f"No supported images found in {directory}")
     images = []
     for path in files:
         if not path.resolve().is_relative_to(RAW_DIR.resolve()):
             raise ValueError(f"Image resolves outside data/raw: {path.name}")
-        image = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        try:
+            image = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        except (OSError, cv2.error) as exc:
+            raise ValueError(f"Cannot read image: {path.name}: {exc}") from exc
         if image is None:
             raise ValueError(f"Cannot decode image: {path.name}")
         if image.ndim != 3 or image.shape[2] != 3 or image.dtype not in (np.uint8, np.uint16):
@@ -364,15 +380,19 @@ def run_view(tool, directory, selected, args):
             "parameters": parameters,
             "versions": {"numpy": np.__version__, "opencv": cv2.__version__},
             "registration": None}
+    if "ifcnn" in selected:
+        # Loaded once per run before any view; its time is not in fusion_seconds.
+        info["ifcnn_model"] = args.ifcnn_model
     image_count = 0
     stage = "load"
     preparation_error = None
     preview_source = None
     start = perf_counter()
     try:
-        images, files = load_images(directory)
-        image_count = len(images)
+        files = find_image_files(directory)
         info["input_files"] = [path.name for path in files]
+        image_count = len(files)
+        images, _ = load_images(directory, files=files)
         stage = "registration"
         aligned, info["registration"] = align_images(images, max_size=args.registration_max_size)
         # Keep only the unwarped reference frame for the ROI preview.
@@ -442,6 +462,13 @@ def run_view(tool, directory, selected, args):
                 elif method == "guided_filter":
                     parameters[name] = guided_filter.resolve_parameters(
                         aligned[0].shape, **overrides)
+                elif method == "ifcnn":
+                    if args.ifcnn_model["error"]:
+                        stage = "model_load"
+                        raise RuntimeError(args.ifcnn_model["error"])
+                    from methods import ifcnn
+
+                    parameters[name] = ifcnn.resolve_parameters(aligned[0].shape, **overrides)
                 stage = "fusion"
                 start = perf_counter()
                 fused = METHODS[method](aligned, **options)
@@ -553,6 +580,18 @@ def main(argv=None):
     elif args.guided_sweep:
         args.sweep = parse_sweep(parser, "--guided-sweep", "guided_filter",
                                  args.guided_sweep, selected)
+    args.ifcnn_model = None
+    if "ifcnn" in selected:
+        # Load, verify and warm up once, outside every fusion timing. A failure is
+        # recorded per view as an ifcnn failure; the other methods still run.
+        try:
+            from methods import ifcnn
+
+            _, model_info = ifcnn.load_model()
+            args.ifcnn_model = {**model_info, "error": None}
+        except Exception as exc:
+            args.ifcnn_model = {"error": f"{type(exc).__name__}: {exc}"}
+            print(f"ifcnn: model loading failed: {args.ifcnn_model['error']}")
     any_success, any_failure = False, False
     for tool, directory in jobs:
         try:

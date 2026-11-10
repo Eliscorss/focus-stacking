@@ -2,3 +2,5 @@
 numpy>=1.24
 opencv-python>=4.8
 matplotlib>=3.7
+# Optional IFCNN: install torch>=2.4 with CUDA support separately (see README).
+# Keep it out of the base dependencies so traditional methods do not install PyTorch.
