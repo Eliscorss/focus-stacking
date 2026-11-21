@@ -27,18 +27,18 @@ DEFAULT_PARAMETERS = {
     # Dimensionless, >= 0. Initial 0.1 (10 percent) is an engineering choice, not a
     # literature value. Larger values ignore milder sharpening; smaller values flag
     # more pixels, including interpolation and rounding differences.
-    "overshoot_factor": 0,
+    "overshoot_factor": 0.1,
     # Absolute floor eps, added after the relative margin, in Sobel magnitude units
     # of the [0, 1] grayscale image (a full black-to-white step gives 4). >= 0.
     # Initial 0.02 is about the response to a step of one to two 8-bit gray levels;
     # engineering choice. Larger values ignore weak overshoot in flat regions;
     # smaller values let flat-region noise count as overshoot.
-    "overshoot_floor": 0,
+    "overshoot_floor": 0.02,
     # Side of the square maximum filter applied to the per-pixel source maximum, in
     # pixels; positive odd integer, 1 disables it. Initial 3 tolerates about one
     # pixel of registration residual. Larger values tolerate more misalignment but
     # can hide seams next to strong edges; 1 is strictest.
-    "source_max_window": 1,
+    "source_max_window": 3,
 }
 
 

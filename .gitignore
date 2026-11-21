@@ -18,6 +18,9 @@ Thumbs.db
 /results/*
 !/results/.gitkeep
 
+# Personal analysis helper, kept local and not delivered.
+/make_comparison.py
+
 # Third-party IFCNN weights have no license for redistribution; README explains
 # where to download them. Keep only the directory placeholder.
 /methods/weights/*
