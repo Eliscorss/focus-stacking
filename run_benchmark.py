@@ -11,7 +11,7 @@ from time import perf_counter
 import cv2
 import numpy as np
 
-from evaluations import sharpness
+from evaluations import artifacts, sharpness
 from methods import guided_filter, laplacian, laplacian_pyramid
 
 
@@ -31,8 +31,13 @@ METHODS = {"laplacian": laplacian.stack, "guided_filter": guided_filter.stack,
            "laplacian_pyramid": laplacian_pyramid.stack, "ifcnn": stack_ifcnn}
 # Placeholder methods are reported as not_implemented without being called.
 UNIMPLEMENTED = set()
-CSV_FIELDS = ("tool", "view", "method", "image_count", "tenengrad",
-              "laplacian_variance", "fusion_seconds", "status", "error")
+CSV_FIELDS = ("tool", "view", "method", "image_count", "tenengrad", "average_gradient",
+              "gradient_overshoot_ratio", "fusion_seconds", "status", "error")
+# (CSV key, panel title, y-axis label, bar color) for metrics_comparison.png.
+CHART_METRICS = (("tenengrad", "Tenengrad", "Score", "#3679a8"),
+                 ("average_gradient", "Average gradient (AG)", "Score", "#3679a8"),
+                 ("gradient_overshoot_ratio", "Gradient overshoot ratio (lower is better)",
+                  "Ratio", "#b5543c"))
 
 
 def natural_key(path):
@@ -266,23 +271,24 @@ def save_roi_preview(path, image, roi):
 
 
 def save_chart(path, rows, title):
-    """Plot separate metric axes and annotate unavailable methods without zero bars."""
+    """Plot each metric in its own panel and annotate unavailable methods without zero bars."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    # Widen the figure and tilt labels when sweeps add many long row names.
+    # Widen the figure and tilt labels when sweeps add many long row names. Panels are
+    # stacked because the metrics have unrelated scales.
     tilted = len(rows) > 3
-    figure, axes = plt.subplots(1, 2, figsize=(max(11, 1.8 * len(rows)), 5 if tilted else 4.5),
+    figure, axes = plt.subplots(len(CHART_METRICS), 1, sharex=True,
+                                figsize=(max(6, 1.8 * len(rows)), 10 if tilted else 9.5),
                                 layout="constrained")
     try:
-        for axis, metric, label in zip(axes, ("tenengrad", "laplacian_variance"),
-                                       ("Tenengrad", "Laplacian variance")):
-            valid = [(i, row) for i, row in enumerate(rows) if row["status"] == "success"]
-            axis.bar([i for i, _ in valid], [row[metric] for _, row in valid],
-                     color="#3679a8", width=0.55)
+        valid = [(i, row) for i, row in enumerate(rows) if row["status"] == "success"]
+        for axis, (key, label, unit, color) in zip(axes, CHART_METRICS):
+            axis.bar([i for i, _ in valid], [row[key] for _, row in valid],
+                     color=color, width=0.55)
             for i, row in valid:
-                axis.annotate(f"{row[metric]:.4g}", (i, row[metric]),
+                axis.annotate(f"{row[key]:.4g}", (i, row[key]),
                               xytext=(0, 5), textcoords="offset points", ha="center")
             for i, row in enumerate(rows):
                 if row["status"] != "success":
@@ -290,16 +296,16 @@ def save_chart(path, rows, title):
                               transform=axis.get_xaxis_transform(), ha="center", fontsize=9)
             if not valid:
                 axis.text(0.5, 0.65, "No valid scores", transform=axis.transAxes, ha="center")
-            axis.set_xticks(range(len(rows)), [row["method"] for row in rows],
-                            rotation=30 if tilted else 0, ha="right" if tilted else "center")
-            axis.set_xlim(-0.6, len(rows) - 0.4)
             # Leave headroom so value labels never touch the frame.
-            top = max((row[metric] for _, row in valid), default=0)
+            top = max((row[key] for _, row in valid), default=0)
             axis.set_ylim(0, top * 1.18 if top > 0 else 1)
             axis.set_title(label)
-            axis.set_ylabel("Score")
+            axis.set_ylabel(unit)
             axis.grid(axis="y", alpha=0.25)
             axis.set_axisbelow(True)
+        axes[-1].set_xticks(range(len(rows)), [row["method"] for row in rows],
+                            rotation=30 if tilted else 0, ha="right" if tilted else "center")
+        axes[-1].set_xlim(-0.6, len(rows) - 0.4)
         figure.suptitle(title)
         temporary = path.with_suffix(".png.tmp")
         figure.savefig(temporary, format="png", dpi=160)
@@ -368,7 +374,8 @@ def run_view(tool, directory, selected, args):
             stale.unlink()
     # Shared settings first; each method's effective parameters are added per method.
     parameters = {"registration_max_size": args.registration_max_size,
-                  "roi_xywh_in_cropped_image": args.roi}
+                  "roi_xywh_in_cropped_image": args.roi,
+                  "gradient_overshoot": artifacts.resolve_parameters()}
     if "laplacian" in selected:
         parameters["laplacian"] = {"window_size": args.window_size,
                                    "smooth_size": args.smooth_size}
@@ -476,7 +483,10 @@ def run_view(tool, directory, selected, args):
                 if not isinstance(fused, np.ndarray) or fused.shape != aligned[0].shape or fused.dtype != aligned[0].dtype:
                     raise ValueError("Fusion must return an image with the input shape and dtype.")
                 stage = "evaluation"
-                scores = sharpness.evaluate(fused, roi=args.roi)
+                # Both metric files share the ROI; overshoot compares against the
+                # same aligned grayscale copies every method received.
+                scores = {**sharpness.evaluate(fused, roi=args.roi),
+                          **artifacts.evaluate(fused, grays, roi=args.roi)}
                 if not all(np.isfinite(value) for value in scores.values()):
                     raise ValueError("Evaluation returned non-finite scores.")
                 stage = "save_image"

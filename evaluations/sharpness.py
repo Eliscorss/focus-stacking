@@ -48,15 +48,27 @@ def tenengrad(image, *, roi=None):
     return float(np.mean(gx[region] ** 2 + gy[region] ** 2, dtype=np.float64))
 
 
-def laplacian_variance(image, *, roi=None):
-    """Return population variance of signed Laplacian responses (ksize=3)."""
+def average_gradient(image, *, roi=None):
+    """Return the average gradient (AG) of Kumar, SIViP 7:1125-1143 (2013), Sec. 3.3.
+
+    AG = sum_ij sqrt((f(i,j) - f(i+1,j))^2 + (f(i,j) - f(i,j+1))^2) / mn, with
+    forward differences and no division by 2 inside the root, as in the paper.
+    The paper uses 8-bit gray values; here f is the normalized [0, 1] grayscale
+    image, so values are the paper's scale divided by 255. The paper does not
+    state how the last row and column are handled; the mean is taken over the
+    same region as Tenengrad, which excludes the outer border, so every
+    evaluated pixel has both forward neighbours.
+    """
     gray, region = _prepare(image, roi)
-    response = cv2.Laplacian(gray, cv2.CV_32F, ksize=3,
-                             borderType=cv2.BORDER_REFLECT_101)
-    return float(np.var(response[region], dtype=np.float64, ddof=0))
+    # Index [i, j] of both difference arrays refers to pixel (i, j) of the image.
+    down = gray[:-1, :-1] - gray[1:, :-1]
+    right = gray[:-1, :-1] - gray[:-1, 1:]
+    magnitude = np.sqrt(down ** 2 + right ** 2)
+    # The region ends at height - 1 and width - 1, so it fits the smaller arrays.
+    return float(np.mean(magnitude[region], dtype=np.float64))
 
 
 def evaluate(image, *, roi=None):
-    """Return separate scores; do not combine them or evaluate input sequences."""
+    """Return separate sharpness scores; do not combine them or evaluate input sequences."""
     return {"tenengrad": tenengrad(image, roi=roi),
-            "laplacian_variance": laplacian_variance(image, roi=roi)}
+            "average_gradient": average_gradient(image, roi=roi)}
